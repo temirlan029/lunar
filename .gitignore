@@ -1,5 +1,7 @@
 .env
 bot.log
 voice_stats.db
+voice_stats.db-shm
+voice_stats.db-wal
 __pycache__/
 *.pyc
