@@ -44,14 +44,15 @@ TARGET_GUILD_ID = int(os.environ["DISCORD_GUILD_ID"]) if os.environ.get("DISCORD
 TARGET_GUILD_OBJECT = discord.Object(id=TARGET_GUILD_ID) if TARGET_GUILD_ID is not None else None
 PORT = int(os.environ.get("PORT", "0"))
 COMMAND_KWARGS = {"guild": TARGET_GUILD_OBJECT} if TARGET_GUILD_OBJECT is not None else {}
+ADMIN_ROLE_ID = 1508160990062317668
 health_server: HTTPServer | None = None
 LOG_PATH = BASE_DIR / "bot.log"
 
 intents = discord.Intents.default()
 intents.voice_states = True
+intents.members = True
 
 bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents)
-active_sessions: dict[int, datetime] = {}
 resolved_guild_id: int | None = TARGET_GUILD_ID
 
 
@@ -166,8 +167,41 @@ def format_duration(seconds: float) -> str:
     return f"{seconds} сек."
 
 
+def build_active_sessions_embed(guild: discord.Guild) -> discord.Embed:
+    now = utc_now()
+    lines: list[str] = []
+
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute("SELECT user_id, started_at FROM active_sessions ORDER BY started_at ASC").fetchall()
+
+    for user_id, started_at_raw in rows:
+        started_at = parse_dt(started_at_raw)
+        member = guild.get_member(user_id)
+        name = member.mention if member else f"<@{user_id}>"
+        lines.append(f"• {name} — `{format_duration((now - started_at).total_seconds())}`")
+
+    return discord.Embed(
+        title="Активные голосовые сессии",
+        description="\n".join(lines) if lines else "Сейчас никто не находится в голосовых каналах.",
+        color=discord.Color.green(),
+        timestamp=datetime.now(MOSCOW_TZ),
+    )
+
+
+def build_dashboard_embed() -> discord.Embed:
+    return discord.Embed(
+        title="Проверка статистики",
+        description="Нажмите кнопку ниже, чтобы открыть меню проверки статистики.",
+        color=discord.Color.green(),
+    )
+
+
 def is_target_guild(guild_id: int) -> bool:
     return resolved_guild_id is None or guild_id == resolved_guild_id
+
+
+def has_voice_admin_role(member: discord.Member) -> bool:
+    return any(role.id == ADMIN_ROLE_ID for role in member.roles)
 
 
 def resolve_target_guild() -> discord.Guild | None:
@@ -190,8 +224,11 @@ def get_total_time_with_active_sessions() -> dict[int, float]:
         totals[user_id] = float(total_time)
 
     now = utc_now()
-    for user_id, started_at in active_sessions.items():
-        totals[user_id] = totals.get(user_id, 0) + (now - started_at).total_seconds()
+    with sqlite3.connect(DB_PATH) as conn:
+        active_rows = conn.execute("SELECT user_id, started_at FROM active_sessions").fetchall()
+
+    for user_id, started_at_raw in active_rows:
+        totals[user_id] = totals.get(user_id, 0) + (now - parse_dt(started_at_raw)).total_seconds()
 
     return totals
 
@@ -203,16 +240,17 @@ def get_user_total_time(user_id: int) -> float:
         if row is not None:
             total = float(row[0])
 
-    started_at = active_sessions.get(user_id)
-    if started_at is not None:
-        total += (utc_now() - started_at).total_seconds()
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute("SELECT started_at FROM active_sessions WHERE user_id = ?", (user_id,)).fetchone()
+
+    if row is not None:
+        total += (utc_now() - parse_dt(row[0])).total_seconds()
 
     return total
 
 
 def start_session(user_id: int, started_at: datetime | None = None) -> None:
     started_at = started_at or utc_now()
-    active_sessions[user_id] = started_at
 
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
@@ -236,7 +274,6 @@ def finish_session(user_id: int, finished_at: datetime | None = None) -> None:
         ).fetchone()
 
         if row is None:
-            active_sessions.pop(user_id, None)
             return
 
         started_at = parse_dt(row[0])
@@ -249,39 +286,44 @@ def finish_session(user_id: int, finished_at: datetime | None = None) -> None:
             )
         conn.execute("DELETE FROM active_sessions WHERE user_id = ?", (user_id,))
 
-    active_sessions.pop(user_id, None)
-
 
 def reset_user_stats(user_id: int) -> None:
-    active_sessions.pop(user_id, None)
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("DELETE FROM active_sessions WHERE user_id = ?", (user_id,))
         conn.execute("DELETE FROM voice_time WHERE user_id = ?", (user_id,))
 
 
 def refresh_active_sessions() -> None:
-    if not active_sessions:
-        return
-
     now_iso = utc_now().isoformat()
     with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute("SELECT user_id FROM active_sessions").fetchall()
+        if not rows:
+            return
         conn.executemany(
             "UPDATE active_sessions SET last_seen_at = ? WHERE user_id = ?",
-            [(now_iso, user_id) for user_id in active_sessions],
+            [(now_iso, user_id) for (user_id,) in rows],
         )
 
 
-def reset_active_sessions() -> None:
-    active_sessions.clear()
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("DELETE FROM active_sessions")
-
-
 def bootstrap_active_sessions(guild: discord.Guild) -> None:
-    reset_active_sessions()
+    current_voice_users = {member.id for channel in guild.voice_channels for member in channel.members if not member.bot}
+
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute("SELECT user_id, started_at, last_seen_at FROM active_sessions").fetchall()
+
+    seen_user_ids: set[int] = set()
+
+    for user_id, started_at_raw, last_seen_raw in rows:
+        seen_user_ids.add(user_id)
+
+        if user_id in current_voice_users:
+            continue
+
+        finish_session(user_id, parse_dt(last_seen_raw))
+
     now = utc_now()
-    for member in (member for channel in guild.voice_channels for member in channel.members if not member.bot):
-        start_session(member.id, now)
+    for user_id in current_voice_users - seen_user_ids:
+        start_session(user_id, now)
 
 
 async def build_stats_embeds(guild: discord.Guild, *, limit: int | None = None) -> list[discord.Embed]:
@@ -321,6 +363,319 @@ async def build_stats_embeds(guild: discord.Guild, *, limit: int | None = None) 
         embeds.append(embed)
 
     return embeds
+
+
+async def build_voice_stats_embed(guild: discord.Guild) -> discord.Embed:
+    return (await build_stats_embeds(guild, limit=10))[0]
+
+
+def build_member_stats_embed(member: discord.Member) -> discord.Embed:
+    total_time = get_user_total_time(member.id)
+    return discord.Embed(
+        title="Моя статистика",
+        description=f"{member.mention}\nВремя в голосовых каналах: `{format_duration(total_time)}`",
+        color=discord.Color.blurple(),
+        timestamp=datetime.now(MOSCOW_TZ),
+    )
+
+
+dashboard_delete_tasks: dict[int, asyncio.Task] = {}
+ephemeral_cleanup_tasks: dict[int, asyncio.Task] = {}
+
+
+def cancel_dashboard_delete(message_id: int) -> None:
+    task = dashboard_delete_tasks.pop(message_id, None)
+    if task is not None:
+        task.cancel()
+
+
+def schedule_dashboard_delete(message: discord.Message, delay: int = 60) -> None:
+    cancel_dashboard_delete(message.id)
+
+    async def _delete_later() -> None:
+        try:
+            await asyncio.sleep(delay)
+            await message.delete()
+        except (asyncio.CancelledError, discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return
+        finally:
+            dashboard_delete_tasks.pop(message.id, None)
+
+    dashboard_delete_tasks[message.id] = asyncio.create_task(_delete_later())
+
+
+def schedule_ephemeral_cleanup(interaction: discord.Interaction, delay: int = 60) -> None:
+    if interaction.message is not None:
+        key = interaction.message.id
+    else:
+        key = interaction.id
+
+    task = ephemeral_cleanup_tasks.pop(key, None)
+    if task is not None:
+        task.cancel()
+
+    async def _cleanup_later() -> None:
+        try:
+            await asyncio.sleep(delay)
+            try:
+                await interaction.delete_original_response()
+                return
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                try:
+                    await interaction.edit_original_response(content="Панель устарела.", embed=None, view=None)
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    return
+        except asyncio.CancelledError:
+            return
+        finally:
+            ephemeral_cleanup_tasks.pop(key, None)
+
+    ephemeral_cleanup_tasks[key] = asyncio.create_task(_cleanup_later())
+
+
+class VoicePanelOpenView(discord.ui.View):
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Проверить", style=discord.ButtonStyle.success, custom_id="lunar:voice_panel:open")
+    async def open_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        if interaction.guild is None or not is_target_guild(interaction.guild.id):
+            await interaction.response.send_message("Эта панель доступна только на целевом сервере.", ephemeral=True)
+            return
+
+        await interaction.response.send_message(
+            embed=build_dashboard_embed(),
+            view=VoiceDashboardView(show_reset=isinstance(interaction.user, discord.Member) and has_voice_admin_role(interaction.user)),
+            ephemeral=True,
+        )
+        schedule_ephemeral_cleanup(interaction)
+
+
+class VoiceDashboardView(discord.ui.View):
+    def __init__(self, *, show_reset: bool = False) -> None:
+        super().__init__(timeout=None)
+        if not show_reset:
+            for item in list(self.children):
+                if isinstance(item, discord.ui.Button) and item.custom_id == "lunar:voice:reset":
+                    self.remove_item(item)
+
+    async def _update(self, interaction: discord.Interaction, *, embed: discord.Embed, view: discord.ui.View | None = None) -> None:
+        await interaction.response.edit_message(embed=embed, content=None, view=view or self)
+        schedule_ephemeral_cleanup(interaction)
+
+    @discord.ui.button(label="Моя статистика", style=discord.ButtonStyle.primary, custom_id="lunar:voice:my_stats")
+    async def my_stats_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        if interaction.guild is None or not is_target_guild(interaction.guild.id):
+            await interaction.response.send_message("Эта панель доступна только на целевом сервере.", ephemeral=True)
+            return
+
+        member = interaction.user if isinstance(interaction.user, discord.Member) else None
+        if member is None:
+            await interaction.response.send_message("Не удалось определить участника.", ephemeral=True)
+            return
+
+        await self._update(interaction, embed=build_member_stats_embed(member))
+
+    @discord.ui.button(label="Участник", style=discord.ButtonStyle.primary, custom_id="lunar:voice:member_stats")
+    async def member_stats_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        if interaction.guild is None or not is_target_guild(interaction.guild.id):
+            await interaction.response.send_message("Эта панель доступна только на целевом сервере.", ephemeral=True)
+            return
+
+        if not isinstance(interaction.user, discord.Member) or not has_voice_admin_role(interaction.user):
+            await interaction.response.send_message("Эта кнопка доступна только для админ-роля.", ephemeral=True)
+            return
+
+        await interaction.response.edit_message(
+            content="Выберите участника для просмотра статистики.",
+            embed=None,
+            view=VoiceMemberStatsSelectView(),
+        )
+        schedule_ephemeral_cleanup(interaction)
+
+    @discord.ui.button(label="Топ 10", style=discord.ButtonStyle.primary, custom_id="lunar:voice:top10")
+    async def voice_stats_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        if interaction.guild is None or not is_target_guild(interaction.guild.id):
+            await interaction.response.send_message("Эта панель доступна только на целевом сервере.", ephemeral=True)
+            return
+
+        await self._update(interaction, embed=await build_voice_stats_embed(interaction.guild))
+
+    @discord.ui.button(label="Активные голосовые каналы", style=discord.ButtonStyle.primary, custom_id="lunar:voice:active")
+    async def voice_active_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        if interaction.guild is None or not is_target_guild(interaction.guild.id):
+            await interaction.response.send_message("Эта панель доступна только на целевом сервере.", ephemeral=True)
+            return
+
+        await self._update(interaction, embed=build_active_sessions_embed(interaction.guild))
+
+    @discord.ui.button(label="Назад", style=discord.ButtonStyle.secondary, custom_id="lunar:voice:back")
+    async def back_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        if interaction.guild is None or not is_target_guild(interaction.guild.id):
+            await interaction.response.send_message("Эта панель доступна только на целевом сервере.", ephemeral=True)
+            return
+
+        await self._update(interaction, embed=build_dashboard_embed())
+
+    @discord.ui.button(label="Сбросить", style=discord.ButtonStyle.danger, custom_id="lunar:voice:reset")
+    async def reset_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        if interaction.guild is None or not is_target_guild(interaction.guild.id):
+            await interaction.response.send_message("Эта панель доступна только на целевом сервере.", ephemeral=True)
+            return
+
+        if not isinstance(interaction.user, discord.Member) or not has_voice_admin_role(interaction.user):
+            await interaction.response.send_message("Эта кнопка доступна только для админ-роля.", ephemeral=True)
+            return
+
+        await interaction.response.edit_message(content="Выберите участника для сброса статистики.", embed=None, view=VoiceResetSelectView())
+        schedule_ephemeral_cleanup(interaction)
+
+
+class VoiceResetSelect(discord.ui.UserSelect):
+    def __init__(self) -> None:
+        super().__init__(placeholder="Выберите участника", min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None or not is_target_guild(interaction.guild.id):
+            await interaction.response.send_message("Эта панель доступна только на целевом сервере.", ephemeral=True)
+            return
+
+        if not isinstance(interaction.user, discord.Member) or not has_voice_admin_role(interaction.user):
+            await interaction.response.send_message("Эта кнопка доступна только для админ-роля.", ephemeral=True)
+            return
+
+        selected = self.values[0]
+        member = interaction.guild.get_member(selected.id)
+        if member is None:
+            try:
+                member = await interaction.guild.fetch_member(selected.id)
+            except discord.HTTPException:
+                await interaction.response.send_message("Не удалось найти участника на сервере.", ephemeral=True)
+                return
+
+        if member.bot:
+            await interaction.response.send_message("Нельзя сбрасывать статистику бота.", ephemeral=True)
+            return
+
+        reset_user_stats(member.id)
+        embed = discord.Embed(
+            title="Статистика сброшена",
+            description=f"Статистика пользователя {member.mention} сброшена.",
+            color=discord.Color.red(),
+            timestamp=datetime.now(MOSCOW_TZ),
+        )
+        await interaction.response.edit_message(embed=embed, content=None, view=VoiceDashboardView(show_reset=True))
+        schedule_ephemeral_cleanup(interaction)
+
+
+class VoiceMemberStatsSelect(discord.ui.UserSelect):
+    def __init__(self) -> None:
+        super().__init__(placeholder="Выберите участника", min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None or not is_target_guild(interaction.guild.id):
+            await interaction.response.send_message("Эта панель доступна только на целевом сервере.", ephemeral=True)
+            return
+
+        if not isinstance(interaction.user, discord.Member) or not has_voice_admin_role(interaction.user):
+            await interaction.response.send_message("Эта кнопка доступна только для админ-роля.", ephemeral=True)
+            return
+
+        selected = self.values[0]
+        member = interaction.guild.get_member(selected.id)
+        if member is None:
+            try:
+                member = await interaction.guild.fetch_member(selected.id)
+            except discord.HTTPException:
+                await interaction.response.send_message("Не удалось найти участника на сервере.", ephemeral=True)
+                return
+
+        embed = discord.Embed(
+            title="Статистика участника",
+            description=f"{member.mention}\nВремя в голосовых каналах: `{format_duration(get_user_total_time(member.id))}`",
+            color=discord.Color.blurple(),
+            timestamp=datetime.now(MOSCOW_TZ),
+        )
+        await interaction.response.edit_message(embed=embed, content=None, view=VoiceDashboardView(show_reset=True))
+        schedule_ephemeral_cleanup(interaction)
+
+
+class VoiceResetSelectView(discord.ui.View):
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+        self.add_item(VoiceResetSelect())
+
+    @discord.ui.button(label="Назад", style=discord.ButtonStyle.secondary, custom_id="lunar:voice:reset_back")
+    async def back_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        if interaction.guild is None or not is_target_guild(interaction.guild.id):
+            await interaction.response.send_message("Эта панель доступна только на целевом сервере.", ephemeral=True)
+            return
+
+        if not isinstance(interaction.user, discord.Member) or not has_voice_admin_role(interaction.user):
+            await interaction.response.send_message("Эта кнопка доступна только для админ-роля.", ephemeral=True)
+            return
+
+        await interaction.response.edit_message(embed=build_dashboard_embed(), content=None, view=VoiceDashboardView(show_reset=True))
+        schedule_ephemeral_cleanup(interaction)
+
+
+class VoiceMemberStatsSelectView(discord.ui.View):
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+        self.add_item(VoiceMemberStatsSelect())
+
+    @discord.ui.button(label="Назад", style=discord.ButtonStyle.secondary, custom_id="lunar:voice:member_stats_back")
+    async def back_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        if interaction.guild is None or not is_target_guild(interaction.guild.id):
+            await interaction.response.send_message("Эта панель доступна только на целевом сервере.", ephemeral=True)
+            return
+
+        if not isinstance(interaction.user, discord.Member) or not has_voice_admin_role(interaction.user):
+            await interaction.response.send_message("Эта кнопка доступна только для админ-роля.", ephemeral=True)
+            return
+
+        await interaction.response.edit_message(embed=build_dashboard_embed(), content=None, view=VoiceDashboardView(show_reset=True))
+        schedule_ephemeral_cleanup(interaction)
+
+
+bot.add_view(VoicePanelOpenView())
+bot.add_view(VoiceDashboardView())
 
 
 def start_health_server() -> None:
@@ -435,19 +790,7 @@ async def voice_active(interaction: discord.Interaction) -> None:
         await interaction.response.send_message("Эта команда доступна только на целевом сервере.", ephemeral=True)
         return
 
-    now = utc_now()
-    lines = []
-    for user_id, started_at in sorted(active_sessions.items(), key=lambda item: item[1]):
-        member = interaction.guild.get_member(user_id)
-        name = member.mention if member else f"<@{user_id}>"
-        lines.append(f"• {name} — `{format_duration((now - started_at).total_seconds())}`")
-
-    embed = discord.Embed(
-        title="Активные голосовые сессии",
-        description="\n".join(lines) if lines else "Сейчас никто не находится в голосовых каналах.",
-        color=discord.Color.green(),
-        timestamp=datetime.now(MOSCOW_TZ),
-    )
+    embed = build_active_sessions_embed(interaction.guild)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -459,6 +802,56 @@ async def report(interaction: discord.Interaction) -> None:
 
     embeds = await build_stats_embeds(interaction.guild)
     await interaction.response.send_message(embeds=embeds[:10], ephemeral=True)
+
+
+@bot.tree.command(name="help", description="Показать список команд и их назначение", **COMMAND_KWARGS)
+async def help_command(interaction: discord.Interaction) -> None:
+    if interaction.guild is None or not is_target_guild(interaction.guild.id):
+        await interaction.response.send_message("Эта команда доступна только на целевом сервере.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="Помощь по командам Lunar",
+        description=(
+            "**/voice_panel** — отправляет панель с кнопками голосовой статистики.\n"
+            "**Участник** — открывает выбор участника для просмотра его статистики.\n"
+            "**/reset** — сбрасывает статистику выбранного участника (только для админ-роля).\n"
+            "**/report** — отправляет текущий полный отчет.\n"
+            "**/stats_user** — показывает статистику выбранного участника.\n"
+            "**/set_report_channel** — задает канал для автоотчетов.\n"
+        ),
+        color=discord.Color.orange(),
+    )
+    embed.add_field(
+        name="Как работает подсчет",
+        value=(
+            "Бот считает время, которое участник реально провел в голосовых каналах.\n"
+            "Переход между voice-каналами внутри сервера не сбрасывает сессию.\n"
+            "Активные сессии хранятся в SQLite и не держатся только в памяти."
+        ),
+        inline=False,
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="voice_panel", description="Отправить панель с кнопками для проверки статистики", **COMMAND_KWARGS)
+async def voice_panel(interaction: discord.Interaction) -> None:
+    if interaction.guild is None or not is_target_guild(interaction.guild.id):
+        await interaction.response.send_message("Эта команда доступна только на целевом сервере.", ephemeral=True)
+        return
+
+    if not isinstance(interaction.user, discord.Member) or not has_voice_admin_role(interaction.user):
+        await interaction.response.send_message("Эта команда доступна только для админ-роля.", ephemeral=True)
+        return
+
+    await interaction.response.send_message(
+        embed=discord.Embed(
+            title="Проверка",
+            description="Нажмите кнопку ниже, чтобы открыть панель голосовой статистики.",
+            color=discord.Color.green(),
+        ),
+        view=VoicePanelOpenView(),
+    )
 
 
 @bot.tree.command(name="stats_user", description="Показать статистику конкретного участника", **COMMAND_KWARGS)
@@ -481,13 +874,16 @@ async def stats_user(
 
 
 @bot.tree.command(name="reset", description="Сбросить статистику конкретного участника", **COMMAND_KWARGS)
-@app_commands.default_permissions(manage_guild=True)
 async def reset(
     interaction: discord.Interaction,
     member: discord.Member,
 ) -> None:
     if interaction.guild is None or not is_target_guild(interaction.guild.id):
         await interaction.response.send_message("Эта команда доступна только на целевом сервере.", ephemeral=True)
+        return
+
+    if not isinstance(interaction.user, discord.Member) or not has_voice_admin_role(interaction.user):
+        await interaction.response.send_message("Эта команда доступна только для админ-роля.", ephemeral=True)
         return
 
     if member.bot:
@@ -590,7 +986,6 @@ async def main() -> None:
         except NotImplementedError:
             signal.signal(sig, lambda *_: request_shutdown())
 
-    reset_active_sessions()
     try:
         await bot.start(TOKEN)
     except Exception as exc:
