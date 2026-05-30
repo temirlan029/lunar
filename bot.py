@@ -107,6 +107,15 @@ def init_db() -> None:
             """
         )
 
+        # Импорт seed-данных при пустой БД (перенос статистики с локалки).
+        row = conn.execute("SELECT COUNT(*) FROM voice_time").fetchone()
+        if row is not None and row[0] == 0:
+            seed_path = BASE_DIR / "seed.sql"
+            if seed_path.exists():
+                log("Импорт seed-данных из seed.sql...")
+                conn.executescript(seed_path.read_text(encoding="utf-8"))
+                log("Seed-данные импортированы.")
+
 
 def parse_dt(value: str) -> datetime:
     return datetime.fromisoformat(value)
