@@ -484,6 +484,27 @@ class VoiceDashboardView(discord.ui.View):
 
         await self._update(interaction, embed=build_member_stats_embed(member))
 
+    @discord.ui.button(label="Участник", style=discord.ButtonStyle.primary, custom_id="lunar:voice:member_stats")
+    async def member_stats_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        if interaction.guild is None or not is_target_guild(interaction.guild.id):
+            await interaction.response.send_message("Эта панель доступна только на целевом сервере.", ephemeral=True)
+            return
+
+        if not isinstance(interaction.user, discord.Member) or not has_voice_admin_role(interaction.user):
+            await interaction.response.send_message("Эта кнопка доступна только для админ-роля.", ephemeral=True)
+            return
+
+        await interaction.response.edit_message(
+            content="Выберите участника для просмотра статистики.",
+            embed=None,
+            view=VoiceMemberStatsSelectView(),
+        )
+        schedule_ephemeral_cleanup(interaction)
+
     @discord.ui.button(label="Топ 10", style=discord.ButtonStyle.primary, custom_id="lunar:voice:top10")
     async def voice_stats_button(
         self,
@@ -575,12 +596,67 @@ class VoiceResetSelect(discord.ui.UserSelect):
         schedule_ephemeral_cleanup(interaction)
 
 
+class VoiceMemberStatsSelect(discord.ui.UserSelect):
+    def __init__(self) -> None:
+        super().__init__(placeholder="Выберите участника", min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None or not is_target_guild(interaction.guild.id):
+            await interaction.response.send_message("Эта панель доступна только на целевом сервере.", ephemeral=True)
+            return
+
+        if not isinstance(interaction.user, discord.Member) or not has_voice_admin_role(interaction.user):
+            await interaction.response.send_message("Эта кнопка доступна только для админ-роля.", ephemeral=True)
+            return
+
+        selected = self.values[0]
+        member = interaction.guild.get_member(selected.id)
+        if member is None:
+            try:
+                member = await interaction.guild.fetch_member(selected.id)
+            except discord.HTTPException:
+                await interaction.response.send_message("Не удалось найти участника на сервере.", ephemeral=True)
+                return
+
+        embed = discord.Embed(
+            title="Статистика участника",
+            description=f"{member.mention}\nВремя в голосовых каналах: `{format_duration(get_user_total_time(member.id))}`",
+            color=discord.Color.blurple(),
+            timestamp=datetime.now(MOSCOW_TZ),
+        )
+        await interaction.response.edit_message(embed=embed, content=None, view=VoiceDashboardView(show_reset=True))
+        schedule_ephemeral_cleanup(interaction)
+
+
 class VoiceResetSelectView(discord.ui.View):
     def __init__(self) -> None:
         super().__init__(timeout=None)
         self.add_item(VoiceResetSelect())
 
     @discord.ui.button(label="Назад", style=discord.ButtonStyle.secondary, custom_id="lunar:voice:reset_back")
+    async def back_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        if interaction.guild is None or not is_target_guild(interaction.guild.id):
+            await interaction.response.send_message("Эта панель доступна только на целевом сервере.", ephemeral=True)
+            return
+
+        if not isinstance(interaction.user, discord.Member) or not has_voice_admin_role(interaction.user):
+            await interaction.response.send_message("Эта кнопка доступна только для админ-роля.", ephemeral=True)
+            return
+
+        await interaction.response.edit_message(embed=build_dashboard_embed(), content=None, view=VoiceDashboardView(show_reset=True))
+        schedule_ephemeral_cleanup(interaction)
+
+
+class VoiceMemberStatsSelectView(discord.ui.View):
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+        self.add_item(VoiceMemberStatsSelect())
+
+    @discord.ui.button(label="Назад", style=discord.ButtonStyle.secondary, custom_id="lunar:voice:member_stats_back")
     async def back_button(
         self,
         interaction: discord.Interaction,
@@ -737,7 +813,8 @@ async def help_command(interaction: discord.Interaction) -> None:
     embed = discord.Embed(
         title="Помощь по командам Lunar",
         description=(
-            "**/voice_panel** — отправляет панель с 3 кнопками голосовой статистики.\n"
+            "**/voice_panel** — отправляет панель с кнопками голосовой статистики.\n"
+            "**Участник** — открывает выбор участника для просмотра его статистики.\n"
             "**/reset** — сбрасывает статистику выбранного участника (только для админ-роля).\n"
             "**/report** — отправляет текущий полный отчет.\n"
             "**/stats_user** — показывает статистику выбранного участника.\n"
